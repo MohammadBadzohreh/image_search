@@ -10,9 +10,6 @@ class DBManager:
             print(f"❌ Connection Error: {e}")
 
     def ensure_collection(self, model_key):
-        """
-        ساخت داینامیک کالکشن بر اساس مدل انتخاب شده
-        """
         cfg = config.MODELS_CONFIG[model_key]
         col_name = cfg["collection_name"]
         dim = cfg["dimension"]
@@ -43,12 +40,7 @@ class DBManager:
 
     def insert_image(self, model_key, vector, path, caption=""):
         col_name = self.ensure_collection(model_key)
-        
-        data = [{
-            "vector": vector, 
-            "path": path,
-            "caption": caption
-        }]
+        data = [{"vector": vector, "path": path, "caption": caption}]
         res = self.client.insert(col_name, data)
         return res
 
@@ -56,8 +48,7 @@ class DBManager:
         cfg = config.MODELS_CONFIG[model_key]
         col_name = cfg["collection_name"]
         
-        if not self.client.has_collection(col_name):
-            return []
+        if not self.client.has_collection(col_name): return []
 
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
         res = self.client.search(
@@ -70,29 +61,20 @@ class DBManager:
         )
         return res[0]
 
-    # 👇 این تابع جا افتاده بود (مخصوص Cleanup)
     def get_all_data(self, model_key, limit=10000):
-        cfg = config.MODELS_CONFIG[model_key]
-        col_name = cfg["collection_name"]
+        col_name = config.MODELS_CONFIG[model_key]["collection_name"]
+        if not self.client.has_collection(col_name): return []
         
-        # اگر کالکشن وجود نداشته باشد، لیست خالی برگردان
-        if not self.client.has_collection(col_name):
-            return []
-            
         res = self.client.query(
             collection_name=col_name,
-            filter="id >= 0", # همه رکوردها
+            filter="id >= 0",
             output_fields=["vector", "path", "caption"],
             limit=limit
         )
         return res
     
-    # 👇 این تابع هم جا افتاده بود (مخصوص Cleanup)
     def delete_by_ids(self, model_key, id_list):
         if not id_list: return
-        
-        cfg = config.MODELS_CONFIG[model_key]
-        col_name = cfg["collection_name"]
-        
+        col_name = config.MODELS_CONFIG[model_key]["collection_name"]
         filter_expr = f"id in {id_list}"
         self.client.delete(collection_name=col_name, filter=filter_expr)
