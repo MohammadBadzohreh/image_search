@@ -1,169 +1,171 @@
 import streamlit as st
-import torch
-from PIL import Image
-from transformers import AutoProcessor, SiglipModel
 import os
 import glob
+from PIL import Image
+import torch
+from tqdm import tqdm
+import config
+# ایمپورت کلاس‌های اصلی که قبلاً ساختیم
+from core.ai_engine import AIEngine
+from core.db_manager import DBManager
 
-# --- CONFIGURATION ---
-# The path you provided
-FLICKR_DATABASE_PATH = "/home/jovyan/work/benchmark/data/flickr30k/Images"
+# --- تنظیمات صفحه ---
+st.set_page_config(
+    page_title="Neural Search Dashboard", 
+    page_icon="🧠", 
+    layout="wide"
+)
 
-MODEL_NAME = "google/siglip-so400m-patch14-384"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+st.title("🧠 Neural Search Dashboard")
+st.markdown("### Manage your embeddings & Bulk Indexing")
 
-# --- LOAD MODEL (Cached) ---
-@st.cache_resource
-def load_model():
-    print(f"🚀 Loading {MODEL_NAME} on {DEVICE}...")
-    model = SiglipModel.from_pretrained(MODEL_NAME).to(DEVICE)
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    return model, processor
+# --- مقداردهی اولیه کلاس‌ها ---
+try:
+    ai = AIEngine()
+    db = DBManager()
+except Exception as e:
+    st.error(f"❌ System Error: {e}")
+    st.stop()
 
-model, processor = load_model()
+# --- SIDEBAR: تنظیمات ---
+with st.sidebar:
+    st.header("⚙️ Batch Config")
+    
+    # 1. انتخاب مدل برای اینسرت (قابلیت جدید)
+    model_options = list(config.MODELS_CONFIG.keys())
+    selected_model = st.selectbox(
+        "Select Target Model:", 
+        model_options, 
+        index=2 # پیش‌فرض روی Jina v2
+    )
+    
+    # نمایش اطلاعات مدل انتخاب شده
+    target_info = config.MODELS_CONFIG[selected_model]
+    st.info(f"Target Collection:\n`{target_info['collection_name']}`\nDimension: `{target_info['dimension']}`")
+    
+    st.divider()
+    
+    # 2. تنظیمات بچ (سرعت)
+    batch_size = st.slider("Batch Size (Speed vs VRAM)", 16, 128, 64)
+    
+    # 3. کپشن (هشدار سرعت)
+    enable_caption = st.checkbox("Generate Captions (⚠️ Very Slow)", value=False, help="Turning this on will make indexing 50x slower!")
 
-# --- HELPER FUNCTIONS ---
-def get_image_files(directory):
-    """Finds all images in the Flickr directory."""
-    # Look for common image formats
-    extensions = ['*.jpg', '*.jpeg', '*.png']
-    files = []
-    for ext in extensions:
-        # Recursive search inside the path
-        files.extend(glob.glob(os.path.join(directory, "**", ext), recursive=True))
-    return files
+# --- MAIN AREA: رابط کاربری ---
 
-def compute_embeddings(image_paths):
-    """Encodes the database images into vectors."""
-    all_embeddings = []
-    valid_paths = []
-    batch_size = 64  # Process 64 images at a time to be fast
+# ورودی مسیر دیتاست
+default_path = config.IMAGE_STORAGE_PATH
+dataset_path = st.text_input("📁 Dataset Path (Folder containing images):", value=default_path)
 
-    # Progress bar UI
+# نمایش وضعیت فعلی کالکشن
+if st.button("📊 Check Collection Status"):
+    try:
+        col_name = target_info['collection_name']
+        if db.client.has_collection(col_name):
+            # دریافت تعداد رکوردها
+            res = db.client.query(collection_name=col_name, output_fields=["count(*)"])
+            count = res[0]["count(*)"]
+            st.success(f"✅ Collection `{col_name}` exists with **{count}** records.")
+        else:
+            st.warning(f"⚠️ Collection `{col_name}` does not exist yet (Will be created on insert).")
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+
+st.divider()
+
+# دکمه شروع عملیات سنگین
+if st.button("🚀 Start Batch Indexing", type="primary"):
+    
+    # 1. بررسی مسیر
+    if not os.path.exists(dataset_path):
+        st.error(f"❌ Path `{dataset_path}` not found!")
+        st.stop()
+
+    # 2. پیدا کردن تمام عکس‌ها
+    st.write("📂 Scanning for images...")
+    image_files = []
+    # جستجوی تمام فرمت‌های رایج
+    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG']:
+        image_files.extend(glob.glob(os.path.join(dataset_path, "**", ext), recursive=True))
+    
+    if not image_files:
+        st.warning("No images found in the specified folder.")
+        st.stop()
+        
+    st.info(f"found **{len(image_files)}** images. Starting indexing process with **{selected_model}**...")
+
+    # 3. اطمینان از وجود کالکشن (ساختن آن در صورت نبودن)
+    db.ensure_collection(selected_model)
+
+    # 4. لود کردن مدل هوش مصنوعی (فقط یکبار)
+    with st.spinner(f"Loading {selected_model} model..."):
+        # تابع load_embedding_model را از کلاس AI Engine صدا می‌زنیم
+        # این تابع خروجی سه تایی برمی‌گرداند: (model, processor, model_type)
+        model_data = ai.load_embedding_model(selected_model)
+
+    # 5. حلقه اصلی پردازش (Batch Loop)
     progress_bar = st.progress(0)
     status_text = st.empty()
-
-    for i in range(0, len(image_paths), batch_size):
-        batch_paths = image_paths[i : i + batch_size]
-        images = []
-        current_batch_paths = []
+    
+    total_files = len(image_files)
+    processed_count = 0
+    
+    # تقسیم فایل‌ها به دسته‌های کوچک (Batch)
+    for i in range(0, total_files, batch_size):
+        batch_paths = image_files[i : i + batch_size]
+        
+        # الف) محاسبه امبدینگ برای این دسته
+        # نکته: ما تابع get_embedding را طوری نوشته بودیم که تکی کار می‌کرد.
+        # برای سرعت بیشتر در Batch، بهتر است مستقیم از مدل استفاده کنیم یا 
+        # اگر می‌خواهید کد تمیز بماند، یک تابع get_batch_embedding به AI Engine اضافه کنید.
+        # اما اینجا برای سادگی، تک تک محاسبه می‌کنیم (یا می‌توانید کد AI Engine را ارتقا دهید)
+        
+        vectors = []
+        valid_paths_in_batch = []
+        captions = []
 
         for path in batch_paths:
             try:
-                img = Image.open(path).convert("RGB")
-                images.append(img)
-                current_batch_paths.append(path)
+                # تولید بردار
+                vec = ai.get_embedding(model_key=selected_model, image=path)
+                
+                # تولید کپشن (اگر فعال باشد)
+                cap = ""
+                if enable_caption:
+                    cap = ai.generate_caption(path)
+                
+                vectors.append(vec)
+                valid_paths_in_batch.append(path)
+                captions.append(cap)
+                
             except Exception as e:
-                continue # Skip broken images
+                print(f"Error processing {path}: {e}")
+                continue
+        
+        # ب) اینسرت دسته‌ای در Milvus
+        if vectors:
+            try:
+                # آماده‌سازی فرمت داده برای Milvus
+                data_to_insert = []
+                for idx, v in enumerate(vectors):
+                    data_to_insert.append({
+                        "vector": v,
+                        "path": valid_paths_in_batch[idx],
+                        "caption": captions[idx]
+                    })
+                
+                # درج در دیتابیس
+                col_name = target_info['collection_name']
+                db.client.insert(col_name, data_to_insert)
+                
+                processed_count += len(data_to_insert)
+            except Exception as e:
+                st.error(f"DB Insert Error: {e}")
 
-        if len(images) == 0:
-            continue
-
-        # Convert images to tensors
-        inputs = processor(images=images, return_tensors="pt").to(DEVICE)
-
-        with torch.no_grad():
-            # Get the visual features
-            features = model.get_image_features(**inputs)
-            # Normalize them (Crucial for Cosine Similarity)
-            features = features / features.norm(p=2, dim=-1, keepdim=True)
-            
-            all_embeddings.append(features.cpu())
-            valid_paths.extend(current_batch_paths)
-
-        # Update progress bar
-        progress = min((i + batch_size) / len(image_paths), 1.0)
+        # بروزرسانی نوار پیشرفت
+        progress = min((i + batch_size) / total_files, 1.0)
         progress_bar.progress(progress)
-        status_text.text(f"Indexed {len(valid_paths)} / {len(image_paths)} images...")
+        status_text.text(f"🚀 Indexed {processed_count} / {total_files} images...")
 
-    if all_embeddings:
-        return torch.cat(all_embeddings), valid_paths
-    return None, []
-
-# --- MAIN APP LAYOUT ---
-st.title("🔎 Flickr30k Neural Search")
-st.write(f"**Database Path:** `{FLICKR_DATABASE_PATH}`")
-
-# --- STEP 1: INDEXING ---
-if 'db_vectors' not in st.session_state:
-    st.info("⚠️ Database not loaded. Click the button below to index your Flickr images.")
-    
-    if st.button("🚀 Load & Index Database"):
-        if not os.path.exists(FLICKR_DATABASE_PATH):
-            st.error(f"❌ Error: The path `{FLICKR_DATABASE_PATH}` does not exist!")
-            st.stop()
-            
-        files = get_image_files(FLICKR_DATABASE_PATH)
-        st.write(f"Found {len(files)} images. Generating embeddings...")
-        
-        vectors, paths = compute_embeddings(files)
-        
-        if vectors is not None:
-            # Store in session state (RAM)
-            st.session_state['db_vectors'] = vectors.to(DEVICE)
-            st.session_state['db_paths'] = paths
-            st.success(f"✅ Successfully indexed {len(paths)} images!")
-            st.rerun() # Refresh page to show search tools
-        else:
-            st.error("No valid images found to index.")
-
-# --- STEP 2: SEARCH INTERFACE ---
-else:
-    st.success(f"✅ Database Ready ({len(st.session_state['db_paths'])} images indexed)")
-    
-    # Toggle between modes
-    mode = st.radio("Select Search Mode:", ["📝 Text-to-Image", "🖼️ Image-to-Image"], horizontal=True)
-    
-    query_vector = None
-
-    # --- MODE A: TEXT SEARCH ---
-    if mode == "📝 Text-to-Image":
-        text_input = st.text_input("Describe the image you want:", placeholder="e.g. A group of people dancing in the street")
-        
-        if text_input:
-            with torch.no_grad():
-                # Encode text
-                inputs = processor(text=[text_input], return_tensors="pt").to(DEVICE)
-                features = model.get_text_features(**inputs)
-                query_vector = features / features.norm(p=2, dim=-1, keepdim=True)
-
-    # --- MODE B: IMAGE SEARCH ---
-    elif mode == "🖼️ Image-to-Image":
-        uploaded = st.file_uploader("Upload an image to find similar ones", type=["jpg", "png", "jpeg"])
-        
-        if uploaded:
-            in_image = Image.open(uploaded).convert("RGB")
-            st.image(in_image, caption="Your Query Image", width=250)
-            
-            with torch.no_grad():
-                # Encode image
-                inputs = processor(images=in_image, return_tensors="pt").to(DEVICE)
-                features = model.get_image_features(**inputs)
-                query_vector = features / features.norm(p=2, dim=-1, keepdim=True)
-
-    # --- STEP 3: PERFORM SEARCH ---
-    if query_vector is not None:
-        db_vectors = st.session_state['db_vectors']
-        
-        # Math: Dot product between query and all database vectors
-        # Result is a list of similarity scores (higher is better)
-        similarities = torch.matmul(query_vector, db_vectors.T).squeeze()
-        
-        # Get top 5 matches
-        top_k = 5
-        scores, indices = torch.topk(similarities, top_k)
-        
-        st.divider()
-        st.subheader("🎯 Top Matches")
-        
-        # Display results in columns
-        cols = st.columns(top_k)
-        for i, col in enumerate(cols):
-            idx = indices[i].item()
-            score = scores[i].item()
-            filepath = st.session_state['db_paths'][idx]
-            filename = os.path.basename(filepath)
-            
-            with col:
-                st.image(filepath, use_container_width=True)
-                st.caption(f"**{score:.2%} Match**\n`{filename}`")
+    st.balloons()
+    st.success(f"🎉 Batch Indexing Completed! Successfully indexed {processed_count} images into `{target_info['collection_name']}`.")

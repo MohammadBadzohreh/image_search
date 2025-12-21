@@ -1,16 +1,16 @@
-# main.py
-import streamlit as st
-from core.db_manager import DBManager
+# config.py
+import torch
 
-st.set_page_config(page_title="Milvus AI Search", page_icon="🧠", layout="wide")
+# Milvus Config
+MILVUS_URI = "http://milvus-standalone:19530" 
+# 👇 نام کالکشن را عوض کردیم تا فیلد جدید Caption ساخته شود
+COLLECTION_NAME = "siglip_gallery_v3_captioned"
+DIMENSION = 1152 
+IMAGE_STORAGE_PATH = "/home/jovyan/work/benchmark/data/flickr30k/Images"
 
-st.title("🧠 AI Image Search Engine")
-st.markdown("### Powered by Milvus & SigLIP")
+# AI Models Config
+EMBEDDING_MODEL = "google/siglip-so400m-patch14-384"
+# 👇 مدل جدید برای تولید متن
+CAPTION_MODEL = "Salesforce/blip-image-captioning-base" 
 
-try:
-    db = DBManager()
-    # گرفتن تعداد داده‌ها (روش تقریبی یا دقیق بسته به نسخه Milvus)
-    st.success("✅ Connected to Milvus Standalone")
-    st.info("Select a page from the sidebar to start!")
-except Exception as e:
-    st.error(f"❌ Could not connect to Database. Ensure Docker is running.\nError: {e}")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
